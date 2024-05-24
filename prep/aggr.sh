@@ -7,6 +7,8 @@
 # To run this, you need to make the "aggregation csv".
 # This csv should contain library_id, molecule_h5, cloupe_file, spatial_folder columns.
 #
+# IMPORTANT NOTE: We did not use this script (i.e. aggregate data from consecutive sections).
+#
 # For details, see https://support.10xgenomics.com/spatial-gene-expression/software/pipelines/latest/using/aggregate
 # Gokberk Alagoz - 10.07.23
 

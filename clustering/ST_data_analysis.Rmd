@@ -1,0 +1,402 @@
+---
+title: "ST_data_analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggplot2)
+library(Matrix)
+library(Rmisc)
+library(ggforce)
+library(rjson)
+library(cowplot)
+library(RColorBrewer)
+library(grid)
+library(hdf5r) # must " module load hdf5/1.10.5 " to use the package
+library(readbitmap)
+library(Seurat)
+library(tibble)
+library(SummarizedExperiment)
+library(rtracklayer)  # must "module unload anaconda" to install the package
+library(SingleCellExperiment)
+library(scran)
+library(scater)
+library(BiocParallel)
+library(PCAtools)
+library(igraph)
+library(cowplot)
+library(jaffelab) ## for ss(), splitit(), myplclust(); actually they are from rafalib
+library(pheatmap)
+library(spatialLIBD)
+```
+
+```{r dirsAndData}
+inDir="/data/workspaces/lag/workspaces/lg-spatial-transcriptomics/working_data/chimp_brain/gokberk/data/input/"
+
+outDir="/data/workspaces/lag/workspaces/lg-spatial-transcriptomics/working_data/chimp_brain/gokberk/results/"
+
+# Read sample names
+sample_names = read.delim(paste0(inDir, "lenas.txt"), as.is=TRUE, header=FALSE)$V1
+# in this lenas.txt, you need to list your sample names, just one column
+image_paths = paste0(inDir, sample_names, "/tissue_lowres_image.png")
+scalefactor_paths = paste0(inDir, sample_names, "/scalefactors_json.json")
+tissue_paths = paste0(inDir, sample_names, "/tissue_positions_list.csv")
+cluster_paths = paste0(inDir, sample_names, "/", sample_names, "_analysis_clustering_graphclust_clusters.csv")
+matrix_paths = paste0(inDir, sample_names, "/", sample_names, "_filtered_feature_bc_matrix.h5")
+
+all(file.exists(c(image_paths, scalefactor_paths, tissue_paths, cluster_paths, matrix_paths)))
+```
+
+```{r}
+## get annotation (you need to revise this part based on the naming rules of your samples)
+map = read.delim(paste0(inDir, "Takki_leFP_003_A1/Takki_leFP_003_A1_raw_feature_bc_matrix_features.tsv.gz"),
+	as.is=TRUE, header=FALSE,col.names=c("EnsemblID", "Symbol", "Type")) # just use this v19s18_052_a1 as an example, you can also load one of your samples, and different samples have the same set of gene_id and gene_name
+
+## get GTF, this seems like what they used
+gtf = import("/data/workspaces/lag/workspaces/lg-spatial-transcriptomics/working_data/chimp_brain/gokberk/resources/ref_genomes_from10x/ref_freshf/chimp_ref/genes/genes.gtf")
+gtf = gtf[gtf$type == "gene"] # this gtf is S4 class in R, we can use [] to extract the data, we only extract "genes", we don't want "transcript", "exon" or others 
+
+# 'map' contains our genes, 'gtf' contains reference genes. I find map$EnsemblID does not match gtf$gene_id, so I need to find overlapping genes
+names(gtf) = gtf$gene_id # extract gtf$gene_id information to give it to @NAMES of gtf, so each row now has a name
+
+# I find the same gene_id corresponds different gene_name in 'gtf' and 'map', and some gene_name has different gene_id, but I finally only use gene_id
+inter_gene_id = intersect(map$EnsemblID, gtf$gene_id)
+inter_gene_symbol_map = map$Symbol[match(inter_gene_id, map$EnsemblID)]
+inter_gene_symbol_gtf = gtf$gene_name[match(inter_gene_id,gtf$gene_id)]
+ind = which(inter_gene_symbol_map==inter_gene_symbol_gtf)
+inter_gene_id_final = inter_gene_id[ind]
+
+gtf = gtf[inter_gene_id_final] # only want overlapping genes between ref and our dataset; NOTE: intersect(map$Symbol,gtf$gene_name) is not intersect(map$EnsemblID,gtf$gene_id)
+seqlevels(gtf)[1:25] = paste0("chr", seqlevels(gtf)[1:25]) # add "chr" in front of chormosome to the seqnames of gtf
+mcols(gtf) = mcols(gtf)[,c(5:8, 18)] # extract the 5th to 9th columns
+
+```
+
+```{r plottingFunction}
+
+geom_spatial <-  function(mapping = NULL,
+                         data = NULL,
+                         stat = "identity",
+                         position = "identity",
+                         na.rm = FALSE,
+                         show.legend = NA,
+                         inherit.aes = FALSE,
+                         ...) {
+  GeomCustom <- ggproto(
+    "GeomCustom",
+    Geom,
+    setup_data = function(self, data, params) {
+      data <- ggproto_parent(Geom, self)$setup_data(data, params)
+      data
+    },
+    
+    draw_group = function(data, panel_scales, coord) {
+      vp <- grid::viewport(x=data$x, y=data$y)
+      g <- grid::editGrob(data$grob[[1]], vp=vp)
+      ggplot2:::ggname("geom_spatial", g)
+    },
+    
+    required_aes = c("grob","x","y")
+    
+  )
+  
+  layer(
+    geom = GeomCustom,
+    mapping = mapping,
+    data = data,
+    stat = stat,
+    position = position,
+    show.legend = show.legend,
+    inherit.aes = inherit.aes,
+    params = list(na.rm = na.rm, ...)
+  )
+}
+#save(geom_spatial,file=paste0(outDir, 'generate_sce/geom_spatial.Rdata'))
+```
+
+```{r}
+## ------------------------------------------------------------------------
+images_cl <- lapply(image_paths, read.bitmap) # we can see there are three dimensions, including length, width and channel (RGB)
+dims = t(sapply(images_cl, dim)) # calculate the dimensions of the images
+colnames(dims) = c("height", "width", "channel") # replace the colnames
+dims = as.data.frame(dims) # convert the matrix to data.frame
+
+## ------------------------------------------------------------------------ 
+# gather infomation from low-resolusion images of capture areas and save them in the "rseList"
+grobs <- lapply(images_cl, rasterGrob, width=unit(1,"npc"), height=unit(1,"npc")) # Render a bitmap image at the given location, size, and orientation
+images_tibble <- tibble(sample=sample_names, grob=grobs) # construct a new data.frame, the same as base::data.frame()
+images_tibble$height = dims$height
+images_tibble$width = dims$width
+images_tibble
+
+## ------------------------------------------------------------------------
+scales <- lapply(scalefactor_paths, function(x) fromJSON(file=x))
+
+## ------------------------------------------------------------------------
+# gather the clustering results (only have spots with transcriptome data) and save it in the "rseList"
+clusters = lapply(cluster_paths, read.csv)
+head(clusters[[1]])
+
+## ------------------------------------------------------------------------
+bcs <- list()
+for (i in 1:length(sample_names)) {
+   bcs[[i]] <- read.csv(tissue_paths[i],col.names=c("barcode","tissue","row","col","imagerow","imagecol"), header = FALSE)
+   bcs[[i]]$sample_name <- sample_names[i]
+   bcs[[i]]$imagerow <- bcs[[i]]$imagerow * scales[[i]]$tissue_lowres_scalef # scale tissue coordinates for lowres image
+   bcs[[i]]$imagecol <- bcs[[i]]$imagecol * scales[[i]]$tissue_lowres_scalef # scale tissue coordinates for lowres image
+   bcs[[i]]$tissue <- as.factor(bcs[[i]]$tissue) # convert it to factor ("0" means no-tissue, "1" means yes-tissue)
+   bcs[[i]] <- merge(bcs[[i]], clusters[[i]], by.x = "barcode", by.y = "Barcode", all = TRUE) # merge data
+   bcs[[i]]$height <- images_tibble$height[i]
+   bcs[[i]]$width <- images_tibble$width[i]
+}
+names(bcs) <- sample_names
+
+head(bcs[[1]])
+
+## ------------------------------------------------------------------------
+```
+
+```{r}
+## keep in regular genomics formatting
+# we need to know that the row name of umiList is gene_name, rather than gene_id
+umiList <- lapply(matrix_paths, Read10X_h5) # collect UMI information for each sample (capture area); umiList contains large sparse matrix
+names(umiList) = sample_names
+sapply(umiList, dim)
+
+# because we only include a subset of genes that overlap with genes in the reference, so we need to extract
+for (i in 1:length(umiList)) {
+   umiList[[i]] = umiList[[i]][gtf$gene_name,]
+}
+
+names(gtf) = gtf$gene_name
+
+# add the image information and clustering results into the "rseList" and save it
+# the full name of rse is RangedSummarizedExperiment
+rseList = list()
+
+for (i in 1:length(bcs)) {
+  
+  rownames(bcs[[i]]) = bcs[[i]]$barcode
+	bcs[[i]] = bcs[[i]][colnames(umiList[[i]]),c(1,7,2:6,8:ncol(bcs[[i]]))]
+	
+	tmp_rse = SummarizedExperiment(assays = list('umis' = umiList[[i]]),
+		                             rowRanges = gtf, colData = bcs[[i]]) # gtf and umiList should have the same subset of genes
+	
+	tmp_rse$sum_umi = colSums(umiList[[i]])
+	tmp_rse$sum_gene = colSums(umiList[[i]] > 0)
+	rseList <- append(rseList, list(tmp_rse))
+  
+}
+
+## add images
+for(i in seq(along=rseList)) {
+	metadata(rseList[[i]])$image = images_tibble[i,]
+}
+
+## save out
+#save(rseList, geom_spatial,
+#	file = paste0(outDir,"/generate_sce/Chimp_leFP_Visium_processedData_rseList.rda"))
+```
+### Create an sce object fom your rse list.
+
+```{r}
+## load rse list
+#load(paste0(outDir,"/generate_sce/Chimp_leFP_Visium_processedData_rseList.rda"), verbose = TRUE)
+
+sceList <- lapply(rseList, function(rse) {
+        SingleCellExperiment(
+        assays = list(counts = assays(rse)$umis),# save this large UMI sparse matrix
+        rowData = rowData(rse), # save the gene info
+        colData = colData(rse), # save the info of sample image
+        metadata = metadata(rse) # save
+    )
+})
+
+#save(sceList, file = paste0(outDir,"/generate_sce/Chimp_leFP_Visium_processedData_sceList.Rdata"))
+
+# combine all spots of different samples (only spots with transcriptome data) into one SCE
+sce <- do.call(cbind, sceList) # "cbind" is to combine elements by rows
+metadata(sce) <- list('image' = do.call(rbind, metadata(sce)))
+table(colData(sce)$sample_name)
+
+names(sceList) = levels(as.factor(colData(sce)$sample_name))
+
+## Add design info (you need to design by yourself)
+# in this csv file, you need to have some information describing the position of your samples, as we collected several spatial replicates within each tissue block
+# 10xID	Description	Rep
+# V13J17-280	Takki_left_FP_s1_003_A1_rep1 - section acquired at position 30 um	replicate 1
+# V13J17-280	Takki_left_FP_s1_003_B1_rep2 - section acquired at position 30 um	replicate 2
+# V13J17-280	Takki_left_FP_s1_004_C1_rep1 - section acquired at position 30 um	replicate 1
+# V13J17-280	Takki_left_FP_s1_004_D1_rep2 - section acquired at position 30 um	replicate 2
+study = read.csv(paste0(inDir, "image_index_10xID.csv"), header = T, sep = "\t")
+
+## same order
+# stopifnot(identical(match(names(sceList), study$CapArea),
+#     seq_len(length(sceList))))
+
+sce$subject <- rep(gsub('s1_|_rep.*', '', study$CapArea),
+    table(colData(sce)$sample_name))
+with(colData(sce), table(sample_name, subject))
+
+sce$position <- rep(gsub('.*position | um', '', study$Description),
+    table(colData(sce)$sample_name))
+with(colData(sce), table(sample_name, position))
+
+sce$replicate <- rep(study$Rep,
+    table(colData(sce)$sample_name))
+with(colData(sce), table(sample_name, replicate))
+
+## For blocking later with scran
+sce$subject_position <- paste0(sce$subject, '_pos', sce$position)
+
+#save(sce, file = paste0(outDir, 'generate_sce/Chimp_leFP_Visium_processedData_sce.Rdata'))
+
+```
+
+```{r}
+#dir.create(paste0(outDir, "pdf_scran"))
+#dir.create(paste0(outDir, "rda_scran"))
+
+## From convert_sce.R
+load(paste0(outDir, "generate_sce/geom_spatial.Rdata"), verbose = TRUE)
+## For resuming and other analyses
+load(paste0(outDir, "generate_sce/Chimp_leFP_Visium_processedData_sce.Rdata"), verbose = TRUE)
+
+qcstats = perCellQCMetrics(sce) # doing QC for each spot ('perCellQCMetrics' is the function of scuttle package)
+qcfilter = quickPerCellQC(qcstats)
+colSums(as.matrix(qcfilter))
+
+with(qcfilter, table(low_lib_size, low_n_features, discard))
+
+table(sce$sample_name[qcfilter$discard])
+
+## Plot discarded umis
+source("/data/workspaces/lag/workspaces/lg-spatial-transcriptomics/working_data/chimp_brain/gokberk/scripts/chimpbrain-st/spatialLIBD_global_plot_code.R")
+#rm(sce_image_clus_p)
+
+sce$discard <- qcfilter$discard
+plots_discard <-
+  lapply(unique(sce$sample_name), function(sampleid) {
+    sce_image_clus(sce, sampleid, "discard", colors = c('light blue', 'red'))
+  })
+
+## remove the folded regions
+sampleid=unique(sce$sample_name)
+for (i in 1:length(sampleid)) {
+  sce_sub=sce[,sce$sample_name==sampleid[i]]
+  sce_sub_info=data.frame(barcode=sce_sub$barcode, imagecol=sce_sub$imagecol, imagerow=sce_sub$imagerow)
+  write.csv(sce_sub_info,file=paste(paste0(inDir, "folded_regions/data/"),sampleid[i],'.csv',sep=""),row.names=F,quote=F)
+}
+
+#pdf(paste0(outDir, "pdf_scran/discarded_cells_grid.pdf"),
+#    height = 10, width = 10) # if there are more figures, we need to scale the height and width, otherwise the spots do not fit
+plot_grid(plotlist = plots_discard)
+#dev.off()
+
+## We have decided not to filter umis since they seem to be layer specific, but if we want to exclude, please use the following code
+#sce <- sce[,!qcfilter$discard]
+
+# manually label the folded region
+# add the labels back to sce 
+fold=c()
+for (i in 1:length(sampleid)) {
+  fold_label=read.csv(paste0(inDir, "folded_regions/data/",sampleid[i],'_fold.csv'))
+  fold=c(fold,as.logical(fold_label$fold))
+}
+sce$fold <- fold
+sce <- sce[,!sce$fold]
+
+# take a look at the gene names 
+aa = data.frame(gene_id = rowData(sce)$gene_id, gene_name = rowData(sce)$gene_name)
+#write.table(aa, file = paste0(outDir, "/generate_sce/geneid_genename.txt"),
+#            quote = F, sep = "\t", row.names = F, col.names = F)
+
+# plots umis after removing these spots
+myPalette <- colorRampPalette(rev(brewer.pal(11, "Spectral")))
+plots_umis=list()
+for (i in 1:length(sampleid)){
+  sce_sub=sce[, sce$sample_name == sampleid[i]]
+  d = as.data.frame(colData(sce_sub))
+  plots_umis[[i]]=ggplot(d, aes(x=imagecol,y=imagerow,fill=sum_umi)) + # draw the frame
+    geom_spatial(data=metadata(sce_sub)$image[i,],
+                 aes(grob=grob), x=0.5, y=0.5) + # add the background image
+    geom_point(shape = 21,  size = 1.25, stroke = 0.25) + # draw the circles
+    coord_cartesian(expand=FALSE)+ # expand to the boundary of the image
+    scale_fill_gradientn(colours = myPalette(100), limits=c(0,30000))+ # adjust the color bar
+    xlim(0,max(sce_sub$width)) + # scale the x axis to fit the background
+    ylim(max(sce_sub$height),0) + # scale the y axis to fit the background
+    xlab("") + ylab("") + # remove the label of x and y axis
+    labs(fill = "Total UMI")+
+    ggtitle(unique(sce_sub$sample_name)) +
+    theme_set(theme_bw(base_size = 10))+
+    theme(panel.grid.major = element_blank(), # set the background as white
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(), 
+          axis.line = element_line(colour = "black"), # set the outline as black
+          axis.text = element_blank(),
+          axis.ticks = element_blank())
+}
+pdf(paste0(outDir, "pdf_scran/umi_by_sample_exc.pdf"), height = 8, width = 10)
+plot_grid(plotlist = plots_umis)
+dev.off()
+
+## Read in the number of cells per spot (if you do not need this, you can also remove this section, it does not affect follow-up analyses)
+cells <- do.call(rbind, lapply(dir(paste0(outDir, "/Histology/")), function(sampleid) {
+  x <- read.csv(file.path(paste0(outDir, "/Histology/", sampleid, '/tissue_spot_counts.csv')))
+  x$key <- paste0(sampleid, '_', x$barcode)
+  return(x[, c('key', 'count')])
+}))
+
+## Used in plotly code in spatialLIBD
+sce$key <- paste0(sce$sample_name, '_', colnames(sce))
+m <- match(sce$key, cells$key)
+stopifnot(!all(is.na(m)))
+sce$cell_count <- cells$count[m]
+
+tapply(sce$cell_count, sce$sample_name, summary)
+# percentage of spots w/0 cells
+nrow(sce[sce$cell_count==0,])*100/nrow(sce)
+# percentage of spots w/1 cells
+nrow(sce[sce$cell_count==1,])*100/nrow(sce)
+
+#pdf(paste0(outDir, "Histology_plots/cellcount_hist_acrossSections.pdf"), height = 8, width = 10)
+hist(sce$cell_count)
+#dev.off()
+
+# plots cell counts
+myPalette <- colorRampPalette(rev(brewer.pal(11, "Spectral")))
+plots_ccounts=list()
+for (i in 1:length(sampleid)){
+  sce_sub=sce[, sce$sample_name == sampleid[i]]
+  d = as.data.frame(colData(sce_sub))
+  plots_ccounts[[i]]=ggplot(d, aes(x=imagecol,y=imagerow,fill=cell_count)) + # draw the frame
+    geom_spatial(data=metadata(sce_sub)$image[i,],
+                 aes(grob=grob), x=0.5, y=0.5) + # add the background image
+    geom_point(shape = 21,  size = 1.25, stroke = 0.25) + # draw the circles
+    coord_cartesian(expand=FALSE)+ # expand to the boundary of the image
+    scale_fill_gradientn(colours = myPalette(100), limits=c(0,20))+ # adjust the color bar
+    xlim(0,max(sce_sub$width)) + # scale the x axis to fit the background
+    ylim(max(sce_sub$height),0) + # scale the y axis to fit the background
+    xlab("") + ylab("") + # remove the label of x and y axis
+    labs(fill = "Cell Count")+
+    ggtitle(unique(sce_sub$sample_name)) +
+    theme_set(theme_bw(base_size = 10))+
+    theme(panel.grid.major = element_blank(), # set the background as white
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(), 
+          axis.line = element_line(colour = "black"), # set the outline as black
+          axis.text = element_blank(),
+          axis.ticks = element_blank())
+}
+#pdf(paste0(outDir, "Histology_plots/cellcount_per_spot.pdf"), height = 8, width = 10)
+plot_grid(plotlist = plots_ccounts)
+#dev.off()
+
+# save this sce, which is the most important part of all data.
+# if you have done this part, congratulations! Processing is done. Next step is to run the analyses that you are interested in based on "sca" structure.
+save(sce, file = paste0(outDir, "generate_sce/Chimp_leFP_Visium_processedData_sce_scran.Rdata"))
+
+```
+

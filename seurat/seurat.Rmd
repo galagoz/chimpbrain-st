@@ -1,0 +1,96 @@
+---
+title: "st_seurat"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(Seurat)
+#options(Seurat.object.assay.version = "v5")
+#library(SeuratData)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+options(future.globals.maxSize = 1e+09)
+```
+
+```{r dataset}
+spaceranger_res = c("/data/workspaces/lag/workspaces/lg-spatial-transcriptomics/working_data/chimp_brain/gokberk/data/takki_st_count/Takki_leFP_003_A1/Takki_leFP_003_A1/outs",
+                    "/data/workspaces/lag/workspaces/lg-spatial-transcriptomics/working_data/chimp_brain/gokberk/data/takki_st_count/Takki_leFP_003_B1/Takki_leFP_003_B1/outs",
+                    "/data/workspaces/lag/workspaces/lg-spatial-transcriptomics/working_data/chimp_brain/gokberk/data/takki_st_count/Takki_leFP_004_C1/Takki_leFP_004_C1/outs",
+                    "/data/workspaces/lag/workspaces/lg-spatial-transcriptomics/working_data/chimp_brain/gokberk/data/takki_st_count/Takki_leFP_004_D1/Takki_leFP_004_D1/outs")
+
+for (capArea in spaceranger_res) {
+
+  tmp_capArea = strsplit(capArea, "/")[[1]][13]
+  tmp_outDir = paste0(as.character(strsplit(capArea, "data/takki")[[1]][1]), "results/seurat/", tmp_capArea)
+  
+  tmp_spatial = Load10X_Spatial(data.dir = capArea,
+                                filename = "filtered_feature_bc_matrix.h5",
+                                assay = "Spatial",
+                                slice = "tissue_lowres_image.png",
+                                filter.matrix = TRUE,
+                                to.upper = FALSE,
+                                image = NULL)
+
+  # preprocessing and plotting
+  #plot1 = VlnPlot(tmp_spatial, features = "nCount_Spatial", pt.size = 0.1) + NoLegend()
+  #plot2 = SpatialFeaturePlot(tmp_spatial, features = "nCount_Spatial") + theme(legend.position = "right")
+  #pdf(paste0(tmp_outDir, "/rawcounts.pdf"), width = 10, height = 6)
+  #wrap_plots(plot1, plot2)
+  #dev.off()
+  
+  tmp_spatial = SCTransform(tmp_spatial, assay = "Spatial", verbose = FALSE)  
+  #plot3 = VlnPlot(tmp_spatial, features = "nCount_Spatial", pt.size = 0.1) + NoLegend()
+  #plot4 = SpatialFeaturePlot(tmp_spatial, features = "nCount_Spatial") + theme(legend.position = "right")
+  #pdf(paste0(tmp_outDir, "/normalizedcounts.pdf"), width = 10, height = 6)
+  #wrap_plots(plot3, plot4)
+  #dev.off()
+  
+  # plot layer markers
+  pdf(paste0(tmp_outDir, "/CCDC68_expression.pdf"), width = 10, height = 7)
+  SpatialFeaturePlot(tmp_spatial, features = c("CCDC68"))
+  dev.off()
+  pdf(paste0(tmp_outDir, "/CARTPT_expression.pdf"), width = 10, height = 7)
+  SpatialFeaturePlot(tmp_spatial, features = c("CARTPT"))
+  dev.off()
+  pdf(paste0(tmp_outDir, "/COL5A2_expression.pdf"), width = 10, height = 7)
+  SpatialFeaturePlot(tmp_spatial, features = c("COL5A2"))
+  dev.off()
+  pdf(paste0(tmp_outDir, "/RORB_expression.pdf"), width = 10, height = 7)
+  SpatialFeaturePlot(tmp_spatial, features = c("RORB"))
+  dev.off()
+  pdf(paste0(tmp_outDir, "/HS3ST2_expression.pdf"), width = 10, height = 7)
+  SpatialFeaturePlot(tmp_spatial, features = c("HS3ST2"))
+  dev.off()
+  pdf(paste0(tmp_outDir, "/ERMN_expression.pdf"), width = 10, height = 7)
+  SpatialFeaturePlot(tmp_spatial, features = c("ERMN"))
+  dev.off()
+  
+  # dimentionality reduction, clustering and visualisation
+  #tmp_spatial = RunPCA(tmp_spatial, assay = "SCT", verbose = FALSE)
+  #tmp_spatial = FindNeighbors(tmp_spatial, reduction = "pca", dims = 1:30)
+  #tmp_spatial = FindClusters(tmp_spatial, verbose = FALSE)
+  #tmp_spatial = RunUMAP(tmp_spatial, reduction = "pca", dims = 1:30)
+  
+  #p5 = DimPlot(tmp_spatial, reduction = "umap", label = TRUE)
+  #p6 = SpatialDimPlot(tmp_spatial, label = TRUE, label.size = 3)
+  #pdf(paste0(tmp_outDir, "/umap_and_spatialDimPlot.pdf"), width = 10, height = 6)
+  #p5 + p6
+  #dev.off()
+  
+  # identification of spatially variable features
+  #de_markers = FindMarkers(tmp_spatial, ident.1 = 4, ident.2 = 1)
+  
+  #pdf(paste0(tmp_outDir, "/de_markers_ident1and4.pdf"), width = 11, height = 6)
+  #SpatialFeaturePlot(object = tmp_spatial, features = rownames(de_markers)[1:3], alpha = c(0.1, 1), ncol = 3)
+  #dev.off()
+  
+}
+
+```
+
+
+```{r}
+
+```
+
